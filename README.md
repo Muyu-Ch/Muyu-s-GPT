@@ -1,0 +1,2 @@
+本人的transformer学习小仓库，做做微型小实验来学习
+直接在m5macbookair上跑
