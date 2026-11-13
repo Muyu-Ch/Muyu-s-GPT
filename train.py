@@ -354,6 +354,30 @@ for iter in range(max_iters):
     loss.backward()
     optimizer.step()
 
+torch.save({
+    'model_state_dict': model.state_dict(),
+    'config': {
+        'n_embd': n_embd,
+        'n_head': n_head,
+        'n_layer': n_layer,
+        'block_size': block_size,
+        'dropout': dropout,
+    },
+    'chars': chars,
+}, 'gpt_checkpoint.pth')
+
+torch.save({
+    'model_state_dict': looped_model.state_dict(),
+    'config': {
+        'n_embd': n_embd,
+        'n_head': n_head,
+        'n_loop': n_loop,
+        'block_size': block_size,
+        'dropout': dropout,
+    },
+    'chars': chars,
+}, 'looped_gpt_checkpoint.pth')
+
 print("Generating text from gpt model...")
 
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
