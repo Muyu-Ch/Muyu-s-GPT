@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 
 batch_size = 32
 
-block_size = 24
+block_size = 128
 
 max_iters = 5000
 
@@ -24,13 +24,13 @@ print("运行平台：",device)
 
 eval_iters = 200
 
-n_embd = 128
+n_embd = 256
 
-n_head = 8
+n_head = 16
 
-n_layer = 6
+n_layer = 12
 
-n_loop=8
+n_loop=16
 
 dropout = 0.2
 
@@ -82,23 +82,33 @@ def estimate_loss(model):
     return out
 
 @torch.no_grad()
-def estimate_loop_losses(model, loop_counts, split='val'):
+def estimate_loop_losses(model, loop_counts, batches):
     """分别用不同的循环层数计算平均 loss。
 
     对每个循环层数都使用同一批数据（同一组 X/Y），
     这样不同层数之间的 loss 差异只来自循环次数，而不是采样噪声。
     """
     model.eval()
-    batches = [get_batch(split) for _ in range(eval_iters)]
     out = {}
     for n_loops in loop_counts:
-        losses = torch.zeros(eval_iters)
+        losses = torch.zeros(len(batches))
         for k, (X, Y) in enumerate(batches):
             _, loss = model.forward_n_loops(X, Y, n_loops=n_loops)
             losses[k] = loss.item()
         out[n_loops] = losses.mean().item()
     model.train()
     return out
+
+@torch.no_grad()
+def estimate_loss_on_batches(model, batches):
+    """普通 GPT 在同一批验证数据上的平均 loss，用于和循环模型公平对比。"""
+    model.eval()
+    losses = torch.zeros(len(batches))
+    for k, (X, Y) in enumerate(batches):
+        _, loss = model(X, Y)
+        losses[k] = loss.item()
+    model.train()
+    return losses.mean().item()
 
 class Head(nn.Module):
     """ one head of self-attention 自注意力机制中的单个注意力头 """
@@ -356,21 +366,26 @@ lmcontext = torch.zeros((1, 1), dtype=torch.long, device=device)
 print(decode(lm.generate(lmcontext, max_new_tokens=500)[0].tolist()))
 open('looped_more.txt', 'w').write(decode(lm.generate(lmcontext, max_new_tokens=10000)[0].tolist()))
 
-# ==================== 计算部分：1..n_loop-1 层验证 loss ====================
-# 1..n_loop-1 层只检测 loss，不生成文本
-print("Evaluating looped_gpt with 1..n_loop-1 loops on validation set...")
+# ==================== 计算部分：1..n_loop 层验证 loss ====================
+# 1..n_loop-1 层只检测 loss，不生成文本；n_loop 层是训练时的完整循环
+# 普通 GPT 也在同一批数据上算一次，作为对照
+print("Evaluating looped_gpt with 1..n_loop loops and the normal gpt on validation set...")
 
-loop_counts = list(range(1, n_loop))
-loop_val_losses = estimate_loop_losses(looped_model, loop_counts, split='val')
+eval_batches = [get_batch('val') for _ in range(eval_iters)]
+loop_counts = list(range(1, n_loop + 1))
+loop_val_losses = estimate_loop_losses(looped_model, loop_counts, eval_batches)
+gpt_val_loss = estimate_loss_on_batches(model, eval_batches)
 
 for n_loops, val_loss in loop_val_losses.items():
     print(f"looped_gpt:{n_loops} loops: val loss {val_loss:.4f}")
+print(f"gpt:full model: val loss {gpt_val_loss:.4f}")
 
-# 保存原始数值，方便以后复查或重新画图
+# 保存原始数值，方便以后复查或重新画图（最后一行为普通 GPT 的对照 loss）
 with open('loop_val_losses.csv', 'w') as f:
     f.write('n_loops,val_loss\n')
     for n_loops, val_loss in loop_val_losses.items():
         f.write(f'{n_loops},{val_loss:.6f}\n')
+    f.write(f'gpt,{gpt_val_loss:.6f}\n')
 
 # ==================== 计算部分结束 ====================
 
@@ -388,24 +403,45 @@ ax.plot(
     color='#2a78d6', linewidth=2,
     marker='o', markersize=8,
     markeredgecolor='#fcfcfb', markeredgewidth=2,
+    label='Looped GPT (same Block reused)',
+)
+# 完整循环（训练时的配置）单独高亮
+ax.plot(
+    counts[-1], losses[-1],
+    color='#d64550', linestyle='none',
+    marker='o', markersize=10,
+    markeredgecolor='#fcfcfb', markeredgewidth=2,
+    label=f'Looped GPT, full {n_loop} loops (trained)',
+)
+# 普通 GPT（不循环）作为水平参考线
+ax.axhline(
+    gpt_val_loss,
+    color='#e08a2e', linewidth=2, linestyle='--',
+    label=f'Normal GPT ({n_layer} layers, no looping)',
 )
 
 ax.set_xticks(counts)
-ax.set_xlim(0.6, n_loop - 0.6)
+ax.set_xlim(0.6, n_loop + 0.6)
 ax.set_xlabel('Number of loop iterations', fontsize=10, color='#52514e')
 ax.set_ylabel('Validation loss', fontsize=10, color='#52514e')
 ax.set_title('Looped GPT: validation loss vs. number of loops', fontsize=13,
              color='#0b0b0b', loc='left', pad=26)
 ax.text(
     0.0, 1.02,
-    f'Trained with {n_loop} loops; 1-{n_loop - 1} evaluated on the same validation batches.',
+    f'Trained with {n_loop} loops; both models evaluated on the same validation batches.',
     transform=ax.transAxes, fontsize=9, color='#52514e',
 )
 ax.text(
     0.98, 0.96,
-    f'best: {best_n} loops\nval loss {loop_val_losses[best_n]:.4f}',
+    f'best: {best_n} loops\nval loss {loop_val_losses[best_n]:.4f}\n'
+    f'normal GPT: {gpt_val_loss:.4f}',
     transform=ax.transAxes, fontsize=9, color='#52514e',
     ha='right', va='top',
+)
+ax.legend(
+    loc='center right', fontsize=8.5, frameon=True,
+    facecolor='#fcfcfb', edgecolor='#e1e0d9', framealpha=1.0,
+    labelcolor='#52514e',
 )
 
 ax.grid(axis='y', color='#e1e0d9', linewidth=0.8)
@@ -423,7 +459,7 @@ print("Saved loop loss plot to looped_val_loss_vs_loops.png")
 # ==================== 生图部分结束 ====================
 
 # 用 2、4、6 层循环生成文本，输出格式与原来的 4 层版本一致
-for n_loops in [2, 4, 6]:
+for n_loops in [4, 8, 12]:
     print(f"Generating text from less_looped_gpt model ({n_loops} loops)...")
 
     less_lmcontext = torch.zeros((1, 1), dtype=torch.long, device=device)
