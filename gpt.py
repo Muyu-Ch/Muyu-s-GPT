@@ -20,6 +20,7 @@ eval_interval = 500
 learning_rate = 3e-4
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print("运行平台：",device)
 
 eval_iters = 200
 
