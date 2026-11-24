@@ -5,7 +5,9 @@ from config import (
     eval_iters, n_embd, n_head, n_layer, n_loop, dropout,
 )
 from model import GPTLanguageModel, LoopedGPTLanguageModel
+# ===== Codex 添加：循环深度逐 token 监测所需的指标函数 =====
 from loop_metrics import estimate_loop_metrics, write_metrics_csv
+# ===== Codex 添加结束 =====
 
 with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
@@ -101,20 +103,24 @@ for iter in range(max_iters):
 print("Training looped_gpt model...")
 
 optimizer = torch.optim.AdamW(looped_model.parameters(), lr=learning_rate)
+# ===== Codex 添加：固定验证样本，用于比较训练过程中各循环深度的指标 =====
 monitor_batches = [get_batch('val') for _ in range(min(8, eval_iters))]
 monitor_history = []
+# ===== Codex 添加结束 =====
 
 for iter in range(max_iters):
 
     if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss(looped_model)
         print(f"looped_gpt:step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        # ===== Codex 添加：记录逐轮 loss 分布和 top-1 正确率 =====
         metrics = estimate_loop_metrics(looped_model, monitor_batches)
         monitor_history.extend({'step': iter, **row} for row in metrics)
         print(f"  same-token val: 1 loop loss {metrics[0]['val_loss']:.4f}, "
               f"accuracy {metrics[0]['accuracy']:.2%}; "
               f"{n_loop} loops loss {metrics[-1]['val_loss']:.4f}, "
               f"accuracy {metrics[-1]['accuracy']:.2%}")
+        # ===== Codex 添加结束 =====
 
     xb, yb = get_batch('train')
 
@@ -123,8 +129,10 @@ for iter in range(max_iters):
     loss.backward()
     optimizer.step()
 
+# ===== Codex 添加：保存训练过程中的逐轮监测结果 =====
 write_metrics_csv('loop_train_metrics.csv', monitor_history)
 print('Saved loop_train_metrics.csv')
+# ===== Codex 添加结束 =====
 
 torch.save({
     'model_state_dict': model.state_dict(),
@@ -156,11 +164,14 @@ torch.save({
 print("Evaluating looped_gpt with 1..n_loop loops and the normal gpt on validation set...")
 
 eval_batches = [get_batch('val') for _ in range(eval_iters)]
+# ===== Codex 添加：在同一批 token 上统计所有循环深度，并保存详细指标 =====
 final_metrics = estimate_loop_metrics(looped_model, eval_batches)
 write_metrics_csv('loop_token_metrics.csv', final_metrics)
 loop_val_losses = {row['n_loops']: row['val_loss'] for row in final_metrics}
+# ===== Codex 添加结束 =====
 gpt_val_loss = estimate_loss_on_batches(model, eval_batches)
 
+# ===== Codex 添加：输出逐轮正确率与 token 状态变化 =====
 for row in final_metrics:
     transition = (f", improved {row['fraction_improved']:.1%}, flat {row['fraction_flat']:.1%}, "
                   f"wrong->right {row['became_correct']:.1%}, right->wrong {row['became_wrong']:.1%}"
@@ -169,6 +180,7 @@ for row in final_metrics:
           f"accuracy {row['accuracy']:.2%}{transition}")
 print(f"gpt:full model: val loss {gpt_val_loss:.4f}")
 print('Saved loop_token_metrics.csv')
+# ===== Codex 添加结束 =====
 
 # 保存原始数值，方便以后复查或重新画图（最后一行为普通 GPT 的对照 loss）
 with open('loop_val_losses.csv', 'w') as f:

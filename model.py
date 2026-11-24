@@ -193,6 +193,7 @@ class LoopedGPTLanguageModel(nn.Module):
 
         return logits,loss
 
+    # ===== Codex 添加：供逐 token 监测复用中间循环结果 =====
     def logits_at_each_loop(self, idx):
         """评估时复用前面循环的计算，逐轮给出 [B, T, vocab] logits。"""
         _, T = idx.shape
@@ -202,6 +203,7 @@ class LoopedGPTLanguageModel(nn.Module):
         for _ in range(self.n_loop):
             x = self.blocks(x)
             yield self.lm_head(self.ln_f(x))
+    # ===== Codex 添加结束 =====
 
 
     @torch.no_grad()

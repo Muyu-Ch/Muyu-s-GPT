@@ -1,5 +1,7 @@
 """同一批验证 token 在不同循环深度下的 loss 与 top-1 正确率。"""
 
+# ===== Codex 添加：本文件为逐 token 循环深度监测功能，用于验证用户的实验猜想 =====
+
 import csv
 
 import torch
@@ -65,3 +67,4 @@ def write_metrics_csv(path, rows):
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+# ===== Codex 添加结束 =====
