@@ -1,4 +1,5 @@
 import torch
+import csv
 
 import torch.nn as nn
 
@@ -23,6 +24,10 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("运行平台：",device)
 
 eval_iters = 200
+
+# 每次训练日志使用固定的验证样本，便于比较不同 step；最终仍用 eval_iters 批。
+loop_monitor_batches = 20
+loss_change_threshold = 0.01  # 单个 token 的交叉熵变化小于此值视为基本持平
 
 n_embd = 256
 
@@ -82,22 +87,59 @@ def estimate_loss(model):
     return out
 
 @torch.no_grad()
-def estimate_loop_losses(model, loop_counts, batches):
-    """分别用不同的循环层数计算平均 loss。
-
-    对每个循环层数都使用同一批数据（同一组 X/Y），
-    这样不同层数之间的 loss 差异只来自循环次数，而不是采样噪声。
-    """
+def estimate_loop_metrics(model, batches):
+    """在同一组 token 上比较 1..n_loop 轮的逐 token loss 和 top-1 正确率。"""
+    was_training = model.training
     model.eval()
-    out = {}
-    for n_loops in loop_counts:
-        losses = torch.zeros(len(batches))
-        for k, (X, Y) in enumerate(batches):
-            _, loss = model.forward_n_loops(X, Y, n_loops=n_loops)
-            losses[k] = loss.item()
-        out[n_loops] = losses.mean().item()
-    model.train()
-    return out
+    all_losses, all_correct = [[] for _ in range(n_loop)], [[] for _ in range(n_loop)]
+    for X, Y in batches:
+        for depth, logits in enumerate(model.logits_at_each_loop(X)):
+            flat_logits = logits.reshape(-1, vocab_size)
+            targets = Y.reshape(-1)
+            all_losses[depth].append(F.cross_entropy(flat_logits, targets, reduction='none').cpu())
+            all_correct[depth].append(flat_logits.argmax(dim=-1).eq(targets).cpu())
+    model.train(was_training)
+    losses = torch.stack([torch.cat(parts) for parts in all_losses])
+    correct = torch.stack([torch.cat(parts) for parts in all_correct])
+
+    # 按第 1 轮的难度固定分组，后续轮次使用完全相同的 token 组。
+    boundaries = torch.quantile(losses[0], torch.tensor([0.25, 0.5, 0.75]))
+    groups = torch.bucketize(losses[0], boundaries)
+    rows = []
+    for depth in range(n_loop):
+        token_loss, token_correct = losses[depth], correct[depth]
+        row = {
+            'n_loops': depth + 1,
+            'val_loss': token_loss.mean().item(),
+            'accuracy': token_correct.float().mean().item(),
+            'loss_p10': torch.quantile(token_loss, 0.1).item(),
+            'loss_p50': torch.quantile(token_loss, 0.5).item(),
+            'loss_p90': torch.quantile(token_loss, 0.9).item(),
+        }
+        for group in range(4):
+            row[f'initial_loss_q{group + 1}'] = token_loss[groups == group].mean().item()
+        if depth:
+            gain = losses[depth - 1] - token_loss
+            previous_correct = correct[depth - 1]
+            row.update({
+                'fraction_improved': (gain > loss_change_threshold).float().mean().item(),
+                'fraction_flat': (gain.abs() <= loss_change_threshold).float().mean().item(),
+                'fraction_worsened': (gain < -loss_change_threshold).float().mean().item(),
+                'became_correct': ((~previous_correct) & token_correct).float().mean().item(),
+                'became_wrong': (previous_correct & (~token_correct)).float().mean().item(),
+                'gain_prev_correct': gain[previous_correct].mean().item() if previous_correct.any() else float('nan'),
+                'gain_prev_wrong': gain[~previous_correct].mean().item() if (~previous_correct).any() else float('nan'),
+            })
+        rows.append(row)
+    return rows
+
+
+def write_metrics_csv(path, rows):
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 @torch.no_grad()
 def estimate_loss_on_batches(model, batches):
@@ -289,6 +331,16 @@ class LoopedGPTLanguageModel(nn.Module):
 
         return logits,loss
 
+    def logits_at_each_loop(self, idx):
+        """评估时共享前面的循环计算，返回每轮的 [B, T, vocab] logits。"""
+        _, T = idx.shape
+        x = self.token_embedding_table(idx) + self.position_embedding_table(
+            torch.arange(T, device=idx.device)
+        )
+        for _ in range(n_loop):
+            x = self.blocks(x)
+            yield self.lm_head(self.ln_f(x))
+
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens):
@@ -340,12 +392,20 @@ for iter in range(max_iters):
 print("Training looped_gpt model...")
 
 optimizer = torch.optim.AdamW(looped_model.parameters(), lr=learning_rate)
+monitor_batches = [get_batch('val') for _ in range(loop_monitor_batches)]
+monitor_history = []
 
 for iter in range(max_iters):
 
     if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss(looped_model)
         print(f"looped_gpt:step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        metrics = estimate_loop_metrics(looped_model, monitor_batches)
+        monitor_history.extend({'step': iter, **row} for row in metrics)
+        first, last = metrics[0], metrics[-1]
+        print(f"  val top-1 accuracy: 1 loop {first['accuracy']:.2%}, "
+              f"{n_loop} loops {last['accuracy']:.2%}; "
+              f"loss: {first['val_loss']:.4f} -> {last['val_loss']:.4f}")
 
     xb, yb = get_batch('train')
 
@@ -353,6 +413,9 @@ for iter in range(max_iters):
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
+
+write_metrics_csv('loop_train_metrics.csv', monitor_history)
+print('Saved per-step loop metrics to loop_train_metrics.csv')
 
 torch.save({
     'model_state_dict': model.state_dict(),
@@ -390,26 +453,33 @@ lmcontext = torch.zeros((1, 1), dtype=torch.long, device=device)
 print(decode(lm.generate(lmcontext, max_new_tokens=500)[0].tolist()))
 open('looped_more.txt', 'w').write(decode(lm.generate(lmcontext, max_new_tokens=10000)[0].tolist()))
 
-# ==================== 计算部分：1..n_loop 层验证 loss ====================
-# 1..n_loop-1 层只检测 loss，不生成文本；n_loop 层是训练时的完整循环
+# ==================== 计算部分：1..n_loop 层验证指标 ====================
+# 1..n_loop-1 层只检测指标，不生成文本；n_loop 层是训练时的完整循环
 # 普通 GPT 也在同一批数据上算一次，作为对照
 print("Evaluating looped_gpt with 1..n_loop loops and the normal gpt on validation set...")
 
 eval_batches = [get_batch('val') for _ in range(eval_iters)]
-loop_counts = list(range(1, n_loop + 1))
-loop_val_losses = estimate_loop_losses(looped_model, loop_counts, eval_batches)
+final_metrics = estimate_loop_metrics(looped_model, eval_batches)
 gpt_val_loss = estimate_loss_on_batches(model, eval_batches)
+write_metrics_csv('loop_token_metrics.csv', final_metrics)
 
-for n_loops, val_loss in loop_val_losses.items():
-    print(f"looped_gpt:{n_loops} loops: val loss {val_loss:.4f}")
+loop_val_losses = {row['n_loops']: row['val_loss'] for row in final_metrics}
+for row in final_metrics:
+    transition = (f", improved {row['fraction_improved']:.1%}, flat {row['fraction_flat']:.1%}, "
+                  f"worsened {row['fraction_worsened']:.1%}, "
+                  f"wrong->right {row['became_correct']:.1%}, right->wrong {row['became_wrong']:.1%}"
+                  if row['n_loops'] > 1 else '')
+    print(f"looped_gpt:{row['n_loops']} loops: val loss {row['val_loss']:.4f}, "
+          f"top-1 accuracy {row['accuracy']:.2%}{transition}")
 print(f"gpt:full model: val loss {gpt_val_loss:.4f}")
 
 # 保存原始数值，方便以后复查或重新画图（最后一行为普通 GPT 的对照 loss）
-with open('loop_val_losses.csv', 'w') as f:
-    f.write('n_loops,val_loss\n')
-    for n_loops, val_loss in loop_val_losses.items():
-        f.write(f'{n_loops},{val_loss:.6f}\n')
-    f.write(f'gpt,{gpt_val_loss:.6f}\n')
+with open('loop_val_losses.csv', 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(['n_loops', 'val_loss'])
+    writer.writerows((depth, f'{loss:.6f}') for depth, loss in loop_val_losses.items())
+    writer.writerow(['gpt', f'{gpt_val_loss:.6f}'])
+print('Saved detailed token metrics to loop_token_metrics.csv')
 
 # ==================== 计算部分结束 ====================
 
