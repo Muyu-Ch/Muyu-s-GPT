@@ -1,40 +1,25 @@
 import torch
 
-import torch.nn as nn
-
-from torch.nn import functional as F
-
 # 生图部分用的 matplotlib
 import matplotlib
 matplotlib.use('Agg')  # 不弹窗，直接把图保存成文件
 import matplotlib.pyplot as plt
 
-batch_size = 32
-
-block_size = 128
-
-max_iters = 5000
-
-eval_interval = 500
-
-learning_rate = 3e-4
-
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print("运行平台：",device)
-
-eval_iters = 200
-
-n_embd = 256
-
-n_head = 16
-
-n_layer = 12
-
-n_loop=16
-
-dropout = 0.2
-
-torch.manual_seed(1337)
+from config import (
+    batch_size,
+    block_size,
+    max_iters,
+    eval_interval,
+    learning_rate,
+    device,
+    eval_iters,
+    n_embd,
+    n_head,
+    n_layer,
+    n_loop,
+    dropout,
+)
+from model import GPTLanguageModel, LoopedGPTLanguageModel
 
 with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
@@ -110,210 +95,8 @@ def estimate_loss_on_batches(model, batches):
     model.train()
     return losses.mean().item()
 
-class Head(nn.Module):
-    """ one head of self-attention 自注意力机制中的单个注意力头 """
-
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(n_embd, head_size, bias=False)
-        self.query = nn.Linear(n_embd, head_size, bias=False)
-        self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer('trill', torch.tril(torch.ones(block_size, block_size)))
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        B,T,C = x.shape
-        k = self.key(x)
-        q = self.query(x)
-        wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5
-        wei = wei.masked_fill(self.trill[:T, :T] == 0, float('-inf'))
-        wei = F.softmax(wei, dim=-1)
-        wei = self.dropout(wei)
-        v = self.value(x)
-        out = wei @ v
-        return out
-
-class MultiHeadAttention(nn.Module):
-    """ multiple heads of self-attention in parallel 并行运行的多个自注意力头 """
-
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(head_size * num_heads, n_embd)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
-        return out
-
-class FeedFoward(nn.Module):
-    """ a simple linear layer followed by a non-linearity 一个简单的线性层，后接非线性激活函数 """
-
-    def __init__(self, n_embd):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-class Block(nn.Module):
-    """ Transformer block: communication followed by computation Transformer 块：先通信（注意力），再计算（前馈网络） """
-
-    def __init__(self, n_embd, n_head):
-        super().__init__()
-        head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
-        self.ffwd = FeedFoward(n_embd)
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
-
-    def forward(self, x):
-        x = x+self.sa(self.ln1(x))
-        x = x+self.ffwd(self.ln2(x))
-        return x
-
-class GPTLanguageModel(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(
-            *[Block(n_embd, n_head=n_head) for _ in range(n_layer)]
-        )
-        # self.blocks=Block(n_embd, n_head=n_head)
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, vocab_size)
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-
-        tok_emb = self.token_embedding_table(idx)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))
-        x = tok_emb + pos_emb
-        x=self.blocks(x)
-        # for i in range(n_layer):
-        #     x = self.blocks(x)
-        x = self.ln_f(x)
-        logits = self.lm_head(x)
-
-        if targets is None:
-            loss = None
-        else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
-
-        return logits,loss
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens):
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -block_size:]
-            logits, loss = self(idx_cond)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
-
-
-class LoopedGPTLanguageModel(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        # self.blocks = nn.Sequential(
-        #     *[Block(n_embd, n_head=n_head) for _ in range(n_layer)]
-        # )
-        self.blocks=Block(n_embd, n_head=n_head)
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, vocab_size)
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, idx, targets=None):
-        # 默认走训练时监督的完整 n_loop 次循环
-        return self.forward_n_loops(idx, targets, n_loops=n_loop)
-
-    def forward_n_loops(self, idx, targets=None, n_loops=n_loop):
-        """把同一个 Block 重复作用 n_loops 次后再接 lm_head。
-
-        n_loops 可以小于训练时的 n_loop，用来检验浅层循环是否也具备预测能力。
-        """
-        B, T = idx.shape
-
-        tok_emb = self.token_embedding_table(idx)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))
-        x = tok_emb + pos_emb
-        #x=self.blocks(x)
-        for i in range(n_loops):
-            x = self.blocks(x)
-        x = self.ln_f(x)
-        logits = self.lm_head(x)
-
-        if targets is None:
-            loss = None
-        else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
-
-        return logits,loss
-
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens):
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -block_size:]
-            logits, loss = self(idx_cond)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
-
-    @torch.no_grad()
-    def generate_n_loops(self, idx, max_new_tokens, n_loops=n_loop):
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -block_size:]
-            logits, loss = self.forward_n_loops(idx_cond, n_loops=n_loops)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
-
-model = GPTLanguageModel()
-looped_model = LoopedGPTLanguageModel()
+model = GPTLanguageModel(vocab_size)
+looped_model = LoopedGPTLanguageModel(vocab_size)
 m = model.to(device)
 print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 

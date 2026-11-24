@@ -4,7 +4,7 @@ import torch
 
 batch_size = 32
 
-block_size = 128
+block_size = 256
 
 max_iters = 5000
 
@@ -21,7 +21,7 @@ n_embd = 256
 
 n_head = 16
 
-n_layer = 12
+n_layer = 16
 
 n_loop=16
 

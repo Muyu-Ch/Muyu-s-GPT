@@ -36,8 +36,7 @@ looped_itos = { i:ch for i,ch in enumerate(looped_chars) }
 
 looped_decode = lambda l: ''.join([looped_itos[i] for i in l])
 
-print("正在根据 checkpoint 创建 looped_gpt 模型 ...")
-
+ 
 looped_model = LoopedGPTLanguageModel(
     vocab_size=len(looped_chars),
     n_embd=looped_config['n_embd'],
