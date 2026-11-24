@@ -1,25 +1,16 @@
 import torch
 
+from config import (
+    batch_size, block_size, max_iters, eval_interval, learning_rate, device,
+    eval_iters, n_embd, n_head, n_layer, n_loop, dropout,
+)
+from model import GPTLanguageModel, LoopedGPTLanguageModel
+from loop_metrics import estimate_loop_metrics, write_metrics_csv
+
 # 生图部分用的 matplotlib
 import matplotlib
 matplotlib.use('Agg')  # 不弹窗，直接把图保存成文件
 import matplotlib.pyplot as plt
-
-from config import (
-    batch_size,
-    block_size,
-    max_iters,
-    eval_interval,
-    learning_rate,
-    device,
-    eval_iters,
-    n_embd,
-    n_head,
-    n_layer,
-    n_loop,
-    dropout,
-)
-from model import GPTLanguageModel, LoopedGPTLanguageModel
 
 with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
@@ -95,8 +86,22 @@ def estimate_loss_on_batches(model, batches):
     model.train()
     return losses.mean().item()
 
-model = GPTLanguageModel(vocab_size)
-looped_model = LoopedGPTLanguageModel(vocab_size)
+model = GPTLanguageModel(
+    vocab_size=vocab_size,
+    n_embd=n_embd,
+    n_head=n_head,
+    n_layer=n_layer,
+    block_size=block_size,
+    dropout=dropout,
+)
+looped_model = LoopedGPTLanguageModel(
+    vocab_size=vocab_size,
+    n_embd=n_embd,
+    n_head=n_head,
+    n_loop=n_loop,
+    block_size=block_size,
+    dropout=dropout,
+)
 m = model.to(device)
 print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
@@ -123,12 +128,20 @@ for iter in range(max_iters):
 print("Training looped_gpt model...")
 
 optimizer = torch.optim.AdamW(looped_model.parameters(), lr=learning_rate)
+monitor_batches = [get_batch('val') for _ in range(min(8, eval_iters))]
+monitor_history = []
 
 for iter in range(max_iters):
 
     if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss(looped_model)
         print(f"looped_gpt:step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        metrics = estimate_loop_metrics(looped_model, monitor_batches)
+        monitor_history.extend({'step': iter, **row} for row in metrics)
+        print(f"  same-token val: 1 loop loss {metrics[0]['val_loss']:.4f}, "
+              f"accuracy {metrics[0]['accuracy']:.2%}; "
+              f"{n_loop} loops loss {metrics[-1]['val_loss']:.4f}, "
+              f"accuracy {metrics[-1]['accuracy']:.2%}")
 
     xb, yb = get_batch('train')
 
@@ -136,6 +149,9 @@ for iter in range(max_iters):
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
+
+write_metrics_csv('loop_train_metrics.csv', monitor_history)
+print('Saved loop_train_metrics.csv')
 
 torch.save({
     'model_state_dict': model.state_dict(),
@@ -180,12 +196,19 @@ print("Evaluating looped_gpt with 1..n_loop loops and the normal gpt on validati
 
 eval_batches = [get_batch('val') for _ in range(eval_iters)]
 loop_counts = list(range(1, n_loop + 1))
-loop_val_losses = estimate_loop_losses(looped_model, loop_counts, eval_batches)
+final_metrics = estimate_loop_metrics(looped_model, eval_batches)
+write_metrics_csv('loop_token_metrics.csv', final_metrics)
+loop_val_losses = {row['n_loops']: row['val_loss'] for row in final_metrics}
 gpt_val_loss = estimate_loss_on_batches(model, eval_batches)
 
-for n_loops, val_loss in loop_val_losses.items():
-    print(f"looped_gpt:{n_loops} loops: val loss {val_loss:.4f}")
+for row in final_metrics:
+    transition = (f", improved {row['fraction_improved']:.1%}, flat {row['fraction_flat']:.1%}, "
+                  f"wrong->right {row['became_correct']:.1%}, right->wrong {row['became_wrong']:.1%}"
+                  if row['n_loops'] > 1 else '')
+    print(f"looped_gpt:{row['n_loops']} loops: val loss {row['val_loss']:.4f}, "
+          f"accuracy {row['accuracy']:.2%}{transition}")
 print(f"gpt:full model: val loss {gpt_val_loss:.4f}")
+print('Saved loop_token_metrics.csv')
 
 # 保存原始数值，方便以后复查或重新画图（最后一行为普通 GPT 的对照 loss）
 with open('loop_val_losses.csv', 'w') as f:

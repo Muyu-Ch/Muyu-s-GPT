@@ -193,6 +193,16 @@ class LoopedGPTLanguageModel(nn.Module):
 
         return logits,loss
 
+    def logits_at_each_loop(self, idx):
+        """评估时复用前面循环的计算，逐轮给出 [B, T, vocab] logits。"""
+        _, T = idx.shape
+        x = self.token_embedding_table(idx) + self.position_embedding_table(
+            torch.arange(T, device=idx.device)
+        )
+        for _ in range(self.n_loop):
+            x = self.blocks(x)
+            yield self.lm_head(self.ln_f(x))
+
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens):
