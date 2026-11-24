@@ -1,5 +1,7 @@
 本人的transformer学习小仓库，做做微型小实验来学习
-直接在m5macbookair上跑
+运行环境：搭载 NVIDIA GeForce RTX 5060 Laptop GPU 的笔记本，Ubuntu 26.04。
+
+`python train.py` 只训练、保存模型检查点和验证指标；需要生成文本时单独运行 `python generate.py`，需要画验证 loss 图时单独运行 `python plot.py`。
 
 运行 `train.py` 后，循环模型会额外生成两个监测文件：
 
