@@ -1,45 +1,16 @@
 import torch
-import csv
 
-import torch.nn as nn
-
-from torch.nn import functional as F
+from config import (
+    batch_size, block_size, max_iters, eval_interval, learning_rate, device,
+    eval_iters, n_embd, n_head, n_layer, n_loop, dropout,
+)
+from model import GPTLanguageModel, LoopedGPTLanguageModel
+from loop_metrics import estimate_loop_metrics, write_metrics_csv
 
 # 生图部分用的 matplotlib
 import matplotlib
 matplotlib.use('Agg')  # 不弹窗，直接把图保存成文件
 import matplotlib.pyplot as plt
-
-batch_size = 32
-
-block_size = 128
-
-max_iters = 5000
-
-eval_interval = 500
-
-learning_rate = 3e-4
-
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print("运行平台：",device)
-
-eval_iters = 200
-
-# 每次训练日志使用固定的验证样本，便于比较不同 step；最终仍用 eval_iters 批。
-loop_monitor_batches = 20
-loss_change_threshold = 0.01  # 单个 token 的交叉熵变化小于此值视为基本持平
-
-n_embd = 256
-
-n_head = 16
-
-n_layer = 12
-
-n_loop=16
-
-dropout = 0.2
-
-torch.manual_seed(1337)
 
 with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
@@ -87,59 +58,22 @@ def estimate_loss(model):
     return out
 
 @torch.no_grad()
-def estimate_loop_metrics(model, batches):
-    """在同一组 token 上比较 1..n_loop 轮的逐 token loss 和 top-1 正确率。"""
-    was_training = model.training
+def estimate_loop_losses(model, loop_counts, batches):
+    """分别用不同的循环层数计算平均 loss。
+
+    对每个循环层数都使用同一批数据（同一组 X/Y），
+    这样不同层数之间的 loss 差异只来自循环次数，而不是采样噪声。
+    """
     model.eval()
-    all_losses, all_correct = [[] for _ in range(n_loop)], [[] for _ in range(n_loop)]
-    for X, Y in batches:
-        for depth, logits in enumerate(model.logits_at_each_loop(X)):
-            flat_logits = logits.reshape(-1, vocab_size)
-            targets = Y.reshape(-1)
-            all_losses[depth].append(F.cross_entropy(flat_logits, targets, reduction='none').cpu())
-            all_correct[depth].append(flat_logits.argmax(dim=-1).eq(targets).cpu())
-    model.train(was_training)
-    losses = torch.stack([torch.cat(parts) for parts in all_losses])
-    correct = torch.stack([torch.cat(parts) for parts in all_correct])
-
-    # 按第 1 轮的难度固定分组，后续轮次使用完全相同的 token 组。
-    boundaries = torch.quantile(losses[0], torch.tensor([0.25, 0.5, 0.75]))
-    groups = torch.bucketize(losses[0], boundaries)
-    rows = []
-    for depth in range(n_loop):
-        token_loss, token_correct = losses[depth], correct[depth]
-        row = {
-            'n_loops': depth + 1,
-            'val_loss': token_loss.mean().item(),
-            'accuracy': token_correct.float().mean().item(),
-            'loss_p10': torch.quantile(token_loss, 0.1).item(),
-            'loss_p50': torch.quantile(token_loss, 0.5).item(),
-            'loss_p90': torch.quantile(token_loss, 0.9).item(),
-        }
-        for group in range(4):
-            row[f'initial_loss_q{group + 1}'] = token_loss[groups == group].mean().item()
-        if depth:
-            gain = losses[depth - 1] - token_loss
-            previous_correct = correct[depth - 1]
-            row.update({
-                'fraction_improved': (gain > loss_change_threshold).float().mean().item(),
-                'fraction_flat': (gain.abs() <= loss_change_threshold).float().mean().item(),
-                'fraction_worsened': (gain < -loss_change_threshold).float().mean().item(),
-                'became_correct': ((~previous_correct) & token_correct).float().mean().item(),
-                'became_wrong': (previous_correct & (~token_correct)).float().mean().item(),
-                'gain_prev_correct': gain[previous_correct].mean().item() if previous_correct.any() else float('nan'),
-                'gain_prev_wrong': gain[~previous_correct].mean().item() if (~previous_correct).any() else float('nan'),
-            })
-        rows.append(row)
-    return rows
-
-
-def write_metrics_csv(path, rows):
-    with open(path, 'w', newline='', encoding='utf-8') as f:
-        fieldnames = list(dict.fromkeys(key for row in rows for key in row))
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    out = {}
+    for n_loops in loop_counts:
+        losses = torch.zeros(len(batches))
+        for k, (X, Y) in enumerate(batches):
+            _, loss = model.forward_n_loops(X, Y, n_loops=n_loops)
+            losses[k] = loss.item()
+        out[n_loops] = losses.mean().item()
+    model.train()
+    return out
 
 @torch.no_grad()
 def estimate_loss_on_batches(model, batches):
@@ -152,220 +86,22 @@ def estimate_loss_on_batches(model, batches):
     model.train()
     return losses.mean().item()
 
-class Head(nn.Module):
-    """ one head of self-attention 自注意力机制中的单个注意力头 """
-
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(n_embd, head_size, bias=False)
-        self.query = nn.Linear(n_embd, head_size, bias=False)
-        self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer('trill', torch.tril(torch.ones(block_size, block_size)))
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        B,T,C = x.shape
-        k = self.key(x)
-        q = self.query(x)
-        wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5
-        wei = wei.masked_fill(self.trill[:T, :T] == 0, float('-inf'))
-        wei = F.softmax(wei, dim=-1)
-        wei = self.dropout(wei)
-        v = self.value(x)
-        out = wei @ v
-        return out
-
-class MultiHeadAttention(nn.Module):
-    """ multiple heads of self-attention in parallel 并行运行的多个自注意力头 """
-
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(head_size * num_heads, n_embd)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
-        return out
-
-class FeedFoward(nn.Module):
-    """ a simple linear layer followed by a non-linearity 一个简单的线性层，后接非线性激活函数 """
-
-    def __init__(self, n_embd):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-class Block(nn.Module):
-    """ Transformer block: communication followed by computation Transformer 块：先通信（注意力），再计算（前馈网络） """
-
-    def __init__(self, n_embd, n_head):
-        super().__init__()
-        head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
-        self.ffwd = FeedFoward(n_embd)
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
-
-    def forward(self, x):
-        x = x+self.sa(self.ln1(x))
-        x = x+self.ffwd(self.ln2(x))
-        return x
-
-class GPTLanguageModel(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(
-            *[Block(n_embd, n_head=n_head) for _ in range(n_layer)]
-        )
-        # self.blocks=Block(n_embd, n_head=n_head)
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, vocab_size)
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-
-        tok_emb = self.token_embedding_table(idx)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))
-        x = tok_emb + pos_emb
-        x=self.blocks(x)
-        # for i in range(n_layer):
-        #     x = self.blocks(x)
-        x = self.ln_f(x)
-        logits = self.lm_head(x)
-
-        if targets is None:
-            loss = None
-        else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
-
-        return logits,loss
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens):
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -block_size:]
-            logits, loss = self(idx_cond)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
-
-
-class LoopedGPTLanguageModel(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        # self.blocks = nn.Sequential(
-        #     *[Block(n_embd, n_head=n_head) for _ in range(n_layer)]
-        # )
-        self.blocks=Block(n_embd, n_head=n_head)
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, vocab_size)
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, idx, targets=None):
-        # 默认走训练时监督的完整 n_loop 次循环
-        return self.forward_n_loops(idx, targets, n_loops=n_loop)
-
-    def forward_n_loops(self, idx, targets=None, n_loops=n_loop):
-        """把同一个 Block 重复作用 n_loops 次后再接 lm_head。
-
-        n_loops 可以小于训练时的 n_loop，用来检验浅层循环是否也具备预测能力。
-        """
-        B, T = idx.shape
-
-        tok_emb = self.token_embedding_table(idx)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))
-        x = tok_emb + pos_emb
-        #x=self.blocks(x)
-        for i in range(n_loops):
-            x = self.blocks(x)
-        x = self.ln_f(x)
-        logits = self.lm_head(x)
-
-        if targets is None:
-            loss = None
-        else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
-
-        return logits,loss
-
-    def logits_at_each_loop(self, idx):
-        """评估时共享前面的循环计算，返回每轮的 [B, T, vocab] logits。"""
-        _, T = idx.shape
-        x = self.token_embedding_table(idx) + self.position_embedding_table(
-            torch.arange(T, device=idx.device)
-        )
-        for _ in range(n_loop):
-            x = self.blocks(x)
-            yield self.lm_head(self.ln_f(x))
-
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens):
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -block_size:]
-            logits, loss = self(idx_cond)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
-
-    @torch.no_grad()
-    def generate_n_loops(self, idx, max_new_tokens, n_loops=n_loop):
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -block_size:]
-            logits, loss = self.forward_n_loops(idx_cond, n_loops=n_loops)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
-
-model = GPTLanguageModel()
-looped_model = LoopedGPTLanguageModel()
+model = GPTLanguageModel(
+    vocab_size=vocab_size,
+    n_embd=n_embd,
+    n_head=n_head,
+    n_layer=n_layer,
+    block_size=block_size,
+    dropout=dropout,
+)
+looped_model = LoopedGPTLanguageModel(
+    vocab_size=vocab_size,
+    n_embd=n_embd,
+    n_head=n_head,
+    n_loop=n_loop,
+    block_size=block_size,
+    dropout=dropout,
+)
 m = model.to(device)
 print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
@@ -392,7 +128,7 @@ for iter in range(max_iters):
 print("Training looped_gpt model...")
 
 optimizer = torch.optim.AdamW(looped_model.parameters(), lr=learning_rate)
-monitor_batches = [get_batch('val') for _ in range(loop_monitor_batches)]
+monitor_batches = [get_batch('val') for _ in range(min(8, eval_iters))]
 monitor_history = []
 
 for iter in range(max_iters):
@@ -402,10 +138,10 @@ for iter in range(max_iters):
         print(f"looped_gpt:step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         metrics = estimate_loop_metrics(looped_model, monitor_batches)
         monitor_history.extend({'step': iter, **row} for row in metrics)
-        first, last = metrics[0], metrics[-1]
-        print(f"  val top-1 accuracy: 1 loop {first['accuracy']:.2%}, "
-              f"{n_loop} loops {last['accuracy']:.2%}; "
-              f"loss: {first['val_loss']:.4f} -> {last['val_loss']:.4f}")
+        print(f"  same-token val: 1 loop loss {metrics[0]['val_loss']:.4f}, "
+              f"accuracy {metrics[0]['accuracy']:.2%}; "
+              f"{n_loop} loops loss {metrics[-1]['val_loss']:.4f}, "
+              f"accuracy {metrics[-1]['accuracy']:.2%}")
 
     xb, yb = get_batch('train')
 
@@ -415,7 +151,7 @@ for iter in range(max_iters):
     optimizer.step()
 
 write_metrics_csv('loop_train_metrics.csv', monitor_history)
-print('Saved per-step loop metrics to loop_train_metrics.csv')
+print('Saved loop_train_metrics.csv')
 
 torch.save({
     'model_state_dict': model.state_dict(),
@@ -453,33 +189,33 @@ lmcontext = torch.zeros((1, 1), dtype=torch.long, device=device)
 print(decode(lm.generate(lmcontext, max_new_tokens=500)[0].tolist()))
 open('looped_more.txt', 'w').write(decode(lm.generate(lmcontext, max_new_tokens=10000)[0].tolist()))
 
-# ==================== 计算部分：1..n_loop 层验证指标 ====================
-# 1..n_loop-1 层只检测指标，不生成文本；n_loop 层是训练时的完整循环
+# ==================== 计算部分：1..n_loop 层验证 loss ====================
+# 1..n_loop-1 层只检测 loss，不生成文本；n_loop 层是训练时的完整循环
 # 普通 GPT 也在同一批数据上算一次，作为对照
 print("Evaluating looped_gpt with 1..n_loop loops and the normal gpt on validation set...")
 
 eval_batches = [get_batch('val') for _ in range(eval_iters)]
+loop_counts = list(range(1, n_loop + 1))
 final_metrics = estimate_loop_metrics(looped_model, eval_batches)
-gpt_val_loss = estimate_loss_on_batches(model, eval_batches)
 write_metrics_csv('loop_token_metrics.csv', final_metrics)
-
 loop_val_losses = {row['n_loops']: row['val_loss'] for row in final_metrics}
+gpt_val_loss = estimate_loss_on_batches(model, eval_batches)
+
 for row in final_metrics:
     transition = (f", improved {row['fraction_improved']:.1%}, flat {row['fraction_flat']:.1%}, "
-                  f"worsened {row['fraction_worsened']:.1%}, "
                   f"wrong->right {row['became_correct']:.1%}, right->wrong {row['became_wrong']:.1%}"
                   if row['n_loops'] > 1 else '')
     print(f"looped_gpt:{row['n_loops']} loops: val loss {row['val_loss']:.4f}, "
-          f"top-1 accuracy {row['accuracy']:.2%}{transition}")
+          f"accuracy {row['accuracy']:.2%}{transition}")
 print(f"gpt:full model: val loss {gpt_val_loss:.4f}")
+print('Saved loop_token_metrics.csv')
 
 # 保存原始数值，方便以后复查或重新画图（最后一行为普通 GPT 的对照 loss）
-with open('loop_val_losses.csv', 'w', newline='') as f:
-    writer = csv.writer(f)
-    writer.writerow(['n_loops', 'val_loss'])
-    writer.writerows((depth, f'{loss:.6f}') for depth, loss in loop_val_losses.items())
-    writer.writerow(['gpt', f'{gpt_val_loss:.6f}'])
-print('Saved detailed token metrics to loop_token_metrics.csv')
+with open('loop_val_losses.csv', 'w') as f:
+    f.write('n_loops,val_loss\n')
+    for n_loops, val_loss in loop_val_losses.items():
+        f.write(f'{n_loops},{val_loss:.6f}\n')
+    f.write(f'gpt,{gpt_val_loss:.6f}\n')
 
 # ==================== 计算部分结束 ====================
 
