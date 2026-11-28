@@ -1,7 +1,7 @@
 本人的transformer学习小仓库，做做微型小实验来学习
 运行环境：搭载 NVIDIA GeForce RTX 5060 Laptop GPU 的笔记本，Ubuntu 26.04。
 
-`python train.py` 只训练、保存模型检查点和验证指标；需要生成文本时单独运行 `python generate.py`，需要画验证 loss 图时单独运行 `python plot.py`。
+`python train.py` 只训练、保存模型检查点和验证指标；需要生成文本时单独运行 `python generate.py`。安装 `numpy` 和 `matplotlib` 后，运行 `python plot.py` 一次读取全部四份 CSV，生成 `looped_val_loss_vs_loops.png`、`loop_depth_analysis.png` 和 `loop_training_analysis.png`。绘图脚本可以从任意工作目录运行，输出保存在项目目录。
 
 训练现在带 warmup + cosine 学习率、weight decay、梯度裁剪和早停；`gpt_checkpoint.pth` / `looped_gpt_checkpoint.pth` 保存的是验证 loss 最好的 checkpoint，而不是最后一步。
 
