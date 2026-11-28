@@ -3,7 +3,9 @@
 
 `python train.py` 只训练、保存模型检查点和验证指标；需要生成文本时单独运行 `python generate.py`，需要画验证 loss 图时单独运行 `python plot.py`。
 
-运行 `train.py` 后，循环模型会额外生成两个监测文件：
+训练现在带 warmup + cosine 学习率、weight decay、梯度裁剪和早停；`gpt_checkpoint.pth` / `looped_gpt_checkpoint.pth` 保存的是验证 loss 最好的 checkpoint，而不是最后一步。
+
+运行 `train.py` 后，除了 `train_history.csv`（每次评估的 train/val loss 和学习率，用来检查何时开始过拟合），循环模型还会额外生成两个监测文件：
 
 - `loop_train_metrics.csv`：每次训练日志时，在固定的 8 批验证样本上记录 1 到 `n_loop` 轮的指标（`step` 是训练步数）。
 - `loop_token_metrics.csv`：训练结束后，在完整验证批次上记录同样的指标。

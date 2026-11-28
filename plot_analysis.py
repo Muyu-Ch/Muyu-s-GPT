@@ -1,13 +1,15 @@
 """把逐循环深度的监测结果画成两张可读的分析图。
 
 输入：
-  loop_token_metrics.csv   最终模型在 200 批验证样本上的逐深度指标
-  loop_train_metrics.csv   训练过程中每 500 步在固定 8 批样本上的逐深度指标
+  loop_token_metrics.csv   最终模型在验证集上的逐深度指标
+  loop_train_metrics.csv   训练过程中每个 checkpoint 在固定样本上的逐深度指标
   loop_val_losses.csv      普通 GPT 的最终 val loss（对照）
 
 输出：
   loop_depth_analysis.png    最终模型的深度分析（loss / 正确率 / 纠错动态 / 难度分组）
   loop_training_analysis.png 训练过程（loss 热力图 + 关键深度曲线）
+
+图中的标题、最优点、标注数值都从 CSV 现算，重新训练后直接重跑即可。
 """
 
 import csv
@@ -19,6 +21,7 @@ import numpy as np
 from matplotlib.colors import LinearSegmentedColormap, Normalize
 from matplotlib.lines import Line2D
 from matplotlib.patheffects import withStroke
+from matplotlib.ticker import MaxNLocator
 
 # ==================== 设计参数（dataviz skill 的验证调色板） ====================
 SURFACE = "#ffffff"
@@ -83,6 +86,10 @@ depths = np.array([int(r["n_loops"]) for r in final_rows])
 loss = np.array([fnum(r, "val_loss") for r in final_rows])
 accuracy = np.array([fnum(r, "accuracy") for r in final_rows]) * 100
 
+best_loss_depth = int(depths[loss.argmin()])
+trained_depth = int(depths[-1])
+best_acc_depth = int(depths[accuracy.argmax()])
+
 # 条件翻转率：分母是上一轮对应的 token 数，比原始占比更好读
 prev_acc = accuracy / 100
 wrong_to_right = np.array([
@@ -99,12 +106,19 @@ q_keys = [f"initial_loss_q{i}" for i in range(1, 5)]
 q_loss = np.array([[fnum(r, key) for r in final_rows] for key in q_keys])
 q_regret = q_loss - q_loss.min(axis=1, keepdims=True)
 q_best = q_loss.argmin(axis=1) + 1
+q_best_label = []
+for i in range(4):
+    tied = depths[q_loss[i] <= q_loss[i].min() + 1e-3]
+    q_best_label.append(
+        str(int(tied.min())) if tied.min() == tied.max() else f"{int(tied.min())}–{int(tied.max())}"
+    )
 
 # 普通 GPT 基线
 with open("loop_val_losses.csv", newline="", encoding="utf-8") as f:
     gpt_loss = next(float(r["val_loss"]) for r in csv.DictReader(f) if r["n_loops"] == "gpt")
 
-steps = sorted({int(r["step"]) for r in train_rows if int(r["step"]) >= 500})
+# 训练过程中的逐深度 loss（去掉 step 0 的随机初始化，避免压缩色标）
+steps = sorted({int(r["step"]) for r in train_rows if int(r["step"]) > 0})
 step_labels = [str(s) for s in steps]
 grid = np.full((len(depths), len(steps)), np.nan)
 for row in train_rows:
@@ -113,6 +127,17 @@ for row in train_rows:
         grid[int(row["n_loops"]) - 1, steps.index(step)] = fnum(row, "val_loss")
 best_depth_by_step = np.nanargmin(grid, axis=0) + 1
 
+# 共同拐点：用较深的一半深度的最优 step 的中位数
+deep_start = max(1, len(depths) - 8)
+deep_best_steps = [
+    steps[int(np.nanargmin(grid[depth - 1]))]
+    for depth in range(deep_start, len(depths) + 1)
+]
+turn_step = int(np.median(deep_best_steps))
+best16_idx = int(np.nanargmin(grid[-1]))
+best16_step = steps[best16_idx]
+best16_loss = grid[-1, best16_idx]
+
 # ==================== 图 1：最终模型的循环深度分析 ====================
 fig, axes = plt.subplots(2, 2, figsize=(12.6, 9.6))
 fig.subplots_adjust(left=0.065, right=0.975, top=0.865, bottom=0.075, hspace=0.42, wspace=0.24)
@@ -120,18 +145,29 @@ fig.subplots_adjust(left=0.065, right=0.975, top=0.865, bottom=0.075, hspace=0.4
 fig.text(0.065, 0.965, "循环深度分析：收益、饱和与过循环", fontsize=17, fontweight="semibold",
          color=INK, ha="left", va="top")
 fig.text(0.065, 0.925,
-         "最终模型，200 批验证样本。1 个共享 Block 重复 1–16 次；1 → 13 轮 loss 2.73 → 1.52，"
-         "1 → 15 轮正确率 23.5% → 56.7%。",
+         f"最终模型，完整验证集。1 个共享 Block 重复 1–{trained_depth} 次；"
+         f"1 → {best_loss_depth} 轮 loss {loss[0]:.2f} → {loss.min():.2f}，"
+         f"1 → {best_acc_depth} 轮正确率 {accuracy[0]:.1f}% → {accuracy.max():.1f}%。",
          fontsize=9.8, color=INK_2, ha="left", va="top")
 
 # --- A. loss vs depth ---
 ax = axes[0, 0]
-best_loss_depth = int(depths[loss.argmin()])
-trained_depth = int(depths[-1])
-ax.axvspan(best_loss_depth + 0.5, trained_depth + 0.5, color="#f4f4f2", zorder=0)
+y_lo = min(loss.min(), gpt_loss) - 0.10
+y_hi = max(loss.max(), gpt_loss) + 0.12
+ax.set_ylim(y_lo, y_hi)
+if trained_depth > best_loss_depth:
+    ax.axvspan(best_loss_depth + 0.5, trained_depth + 0.5, color="#f4f4f2", zorder=0)
+    ax.text((best_loss_depth + trained_depth) / 2 + 0.5, y_hi - 0.02, "过循环区",
+            fontsize=8.8, color=GRAY, ha="center", va="top")
 ax.axhline(gpt_loss, color=GRAY, linewidth=1.4, zorder=2)
-ax.text(9.3, gpt_loss + 0.035, f"普通 GPT（16 层）{gpt_loss:.3f}", fontsize=8.8, color=INK_2,
-        ha="left", va="bottom")
+gpt_label_x = 9.3
+gpt_label_y = gpt_loss + 0.035
+gpt_label_va = "bottom"
+if gpt_loss < np.interp(gpt_label_x, depths, loss):
+    gpt_label_y = gpt_loss - 0.035
+    gpt_label_va = "top"
+ax.text(gpt_label_x, gpt_label_y, f"普通 GPT（16 层）{gpt_loss:.3f}",
+        fontsize=8.8, color=INK_2, ha="left", va=gpt_label_va)
 ax.plot(depths, loss, color=BLUE, linewidth=2.0, solid_capstyle="round", zorder=3)
 ax.plot(depths, loss, "o", color=BLUE, markersize=4.0, markeredgecolor=SURFACE,
         markeredgewidth=1.1, zorder=4)
@@ -140,26 +176,31 @@ ax.plot(depths[loss.argmin()], loss.min(), "o", color=BLUE, markersize=8.5,
 ax.plot(trained_depth, loss[-1], "o", markerfacecolor=SURFACE, markeredgecolor=BLUE,
         markersize=8.5, markeredgewidth=2.0, zorder=5)
 ax.annotate(f"最优 {best_loss_depth} 轮 · {loss.min():.3f}",
-            xy=(best_loss_depth, loss.min()), xytext=(2.0, 1.395),
+            xy=(best_loss_depth, loss.min()), xytext=(2.0, y_lo + 0.04),
             fontsize=9.2, color=INK, ha="left", va="bottom",
             arrowprops=dict(arrowstyle="-", color=AXIS, linewidth=0.8))
 ax.annotate(f"训练深度 {trained_depth} 轮 · {loss[-1]:.3f}",
             xy=(trained_depth, loss[-1]), xytext=(trained_depth - 0.4, loss[-1] + 0.16),
             fontsize=9.2, color=INK, ha="right", va="bottom",
             arrowprops=dict(arrowstyle="-", color=AXIS, linewidth=0.8))
-ax.text(best_loss_depth + 1.55, 2.60, "过循环区", fontsize=8.8, color=GRAY, ha="center")
-ax.set_xlim(0.6, 16.4)
-ax.set_ylim(1.35, 2.82)
+ax.set_xlim(0.6, trained_depth + 0.4)
 ax.set_xticks(depths)
 ax.set_xlabel("循环深度（同一个 Block 复用次数）", fontsize=9.5)
 ax.set_ylabel("验证交叉熵 loss", fontsize=9.5)
-ax.set_title("A  loss：13 轮见底，16 轮反而更差", loc="left", fontsize=11.5,
+if best_loss_depth == trained_depth:
+    loss_tail = "训练深度即最优"
+elif loss[-1] > loss.min():
+    loss_tail = f"{trained_depth} 轮反而更差"
+else:
+    loss_tail = "之后基本持平"
+ax.set_title(f"A  loss：{best_loss_depth} 轮见底，{loss_tail}", loc="left", fontsize=11.5,
              fontweight="semibold", pad=8)
 style_axis(ax)
 
 # --- B. accuracy vs depth ---
 ax = axes[0, 1]
-best_acc_depth = int(depths[accuracy.argmax()])
+acc_top = max(62.0, accuracy.max() + 6)
+ax.set_ylim(20, acc_top)
 ax.plot(depths, accuracy, color=BLUE, linewidth=2.0, solid_capstyle="round", zorder=3)
 ax.plot(depths, accuracy, "o", color=BLUE, markersize=4.0, markeredgecolor=SURFACE,
         markeredgewidth=1.1, zorder=4)
@@ -169,17 +210,24 @@ ax.plot(trained_depth, accuracy[-1], "o", markerfacecolor=SURFACE, markeredgecol
         markersize=8.5, markeredgewidth=2.0, zorder=5)
 ax.annotate(f"{accuracy[0]:.1f}%", xy=(1, accuracy[0]), xytext=(1.35, accuracy[0] + 1.8),
             fontsize=9.2, color=INK, ha="left", va="bottom")
-ax.annotate(f"最优 {best_acc_depth} 轮 {accuracy.max():.1f}%\n16 轮基本持平",
-            xy=(best_acc_depth, accuracy.max()), xytext=(12.5, 60.2),
+ax.annotate(f"最优 {best_acc_depth} 轮 {accuracy.max():.1f}%\n{trained_depth} 轮基本持平",
+            xy=(best_acc_depth, accuracy.max()),
+            xytext=(best_acc_depth - 2.5, acc_top - 2.0),
             fontsize=9.2, color=INK, ha="right", va="top",
             arrowprops=dict(arrowstyle="-", color=AXIS, linewidth=0.8))
-ax.text(1.8, 56.2, "前 9 轮完成约 89% 的正确率增益", fontsize=8.8, color=INK_2, ha="left")
-ax.set_xlim(0.6, 16.4)
-ax.set_ylim(20, 62)
+gain_target = accuracy[0] + 0.9 * (accuracy.max() - accuracy[0])
+n90 = int(depths[np.argmax(accuracy >= gain_target)])
+ax.text(1.8, accuracy.max() - 1.0, f"前 {n90} 轮完成约 90% 的正确率增益",
+        fontsize=8.8, color=INK_2, ha="left", va="top")
+ax.set_xlim(0.6, trained_depth + 0.4)
 ax.set_xticks(depths)
 ax.set_xlabel("循环深度（同一个 Block 复用次数）", fontsize=9.5)
 ax.set_ylabel("top-1 正确率 (%)", fontsize=9.5)
-ax.set_title("B  正确率：15 轮见顶，之后不再提升", loc="left", fontsize=11.5,
+if best_acc_depth == trained_depth:
+    acc_tail = "训练深度即最优"
+else:
+    acc_tail = "之后不再提升"
+ax.set_title(f"B  正确率：{best_acc_depth} 轮见顶，{acc_tail}", loc="left", fontsize=11.5,
              fontweight="semibold", pad=8)
 style_axis(ax)
 
@@ -193,15 +241,21 @@ ax.plot(depths[1:], right_to_wrong[1:], color=RED, linewidth=2.0, solid_capstyle
         label="正确 → 错误", zorder=3)
 ax.plot(depths[1:], right_to_wrong[1:], "o", color=RED, markersize=4.0,
         markeredgecolor=SURFACE, markeredgewidth=1.1, zorder=4)
-ax.annotate("纠错约为破坏的 3 倍", xy=(6, 8.44), xytext=(7.1, 5.9), fontsize=8.8, color=INK_2,
-            ha="left", va="center",
+
+ratios = wrong_to_right[1:] / right_to_wrong[1:]
+peak_i = int(np.nanargmax(ratios))
+peak_depth = int(depths[1:][peak_i])
+peak_ratio = ratios[peak_i]
+ax.text(0.02, 0.97, f"峰值：第 {peak_depth} 轮，纠错是破坏的 {peak_ratio:.1f} 倍",
+        transform=ax.transAxes, fontsize=8.8, color=INK_2, ha="left", va="top")
+last_ratio = wrong_to_right[-1] / right_to_wrong[-1]
+ax.annotate(f"最后一轮：纠错/破坏 = {last_ratio:.1f}",
+            xy=(depths[-1], right_to_wrong[-1]), xytext=(depths[-1] - 0.5, 0.45),
+            fontsize=8.8, color=INK_2, ha="right", va="bottom",
             arrowprops=dict(arrowstyle="-", color=AXIS, linewidth=0.8))
-ax.annotate("15–16 轮接近持平", xy=(16, 1.28), xytext=(12.4, 0.45), fontsize=8.8, color=INK_2,
-            ha="right", va="bottom",
-            arrowprops=dict(arrowstyle="-", color=AXIS, linewidth=0.8))
-ax.set_xlim(1.6, 16.5)
-ax.set_ylim(0, 10.6)
-ax.set_xticks(range(2, 17, 2))
+ax.set_xlim(1.6, trained_depth + 0.5)
+ax.set_ylim(0, max(10.6, np.nanmax(wrong_to_right) + 0.8))
+ax.set_xticks(range(2, trained_depth + 1, 2))
 ax.set_xlabel("循环深度", fontsize=9.5)
 ax.set_ylabel("占上一轮对应 token 的比例 (%)", fontsize=9.5)
 ax.set_title("C  每一轮是在纠错，还是在制造新错误？", loc="left", fontsize=11.5,
@@ -212,7 +266,6 @@ style_axis(ax)
 # --- D. 四组难度的相对 loss 增量 ---
 ax = axes[1, 1]
 q_names = ["q1 最简单", "q2", "q3", "q4 最难"]
-q_best_label = ["9", "11–12", "12", "14–15"]
 handles = []
 for i, (name, color) in enumerate(zip(q_names, ORDINAL_4)):
     ax.plot(depths, q_regret[i], color=color, linewidth=2.0, solid_capstyle="round", zorder=3)
@@ -222,8 +275,8 @@ for i, (name, color) in enumerate(zip(q_names, ORDINAL_4)):
             markeredgecolor=SURFACE, markeredgewidth=1.8, zorder=5)
     handles.append(Line2D([0], [0], color=color, linewidth=2.0,
                           label=f"{name} · 最优 {q_best_label[i]} 轮"))
-ax.set_xlim(0.6, 16.4)
-ax.set_ylim(-0.10, 2.10)
+ax.set_xlim(0.6, trained_depth + 0.4)
+ax.set_ylim(-0.10, max(2.10, float(np.nanmax(q_regret)) + 0.10))
 ax.set_xticks(depths)
 ax.set_xlabel("循环深度", fontsize=9.5)
 ax.set_ylabel("相对该组自身最优的 loss 增量", fontsize=9.5)
@@ -249,14 +302,18 @@ fig.text(0.055, 0.955, "训练过程：循环能力怎么长出来的", fontsize
          color=INK, ha="left", va="top")
 fig.text(0.055, 0.900,
          "固定 8 批验证样本；每个 checkpoint 在同一批 token 上评估 1–16 轮。\n"
-         "热力图深色 = loss 更高，细线 = 每步最优深度（16 → 12）；"
-         "step 3000 后所有深度回升，最后 2000 步基本是过拟合。",
+         f"热力图深色 = loss 更高，细线 = 每步最优深度（{best_depth_by_step[0]} → {best_depth_by_step[-1]}）；"
+         "深层曲线在同一个拐点见底，1 轮从更早开始变差。",
          fontsize=9.4, color=INK_2, ha="left", va="top", linespacing=1.7)
 
 # --- A. 热力图 ---
 ax = axes[0]
 cmap = LinearSegmentedColormap.from_list("seq_blue", SEQUENTIAL)
-norm = Normalize(vmin=1.45, vmax=2.75)
+vmin = float(np.nanmin(grid))
+vmax = float(np.nanmax(grid))
+if vmax - vmin < 1e-6:
+    vmax = vmin + 1e-3
+norm = Normalize(vmin=vmin, vmax=vmax)
 im = ax.imshow(grid, aspect="auto", cmap=cmap, norm=norm, origin="lower",
                interpolation="nearest")
 ridge = best_depth_by_step - 1
@@ -282,43 +339,53 @@ cbar.ax.tick_params(colors=GRAY, labelsize=8.0, length=2.5)
 for label in cbar.ax.get_yticklabels():
     label.set_color(INK_2)
 cbar.set_label("val loss", color=INK_2, fontsize=9.0)
-cbar.set_ticks([1.5, 2.0, 2.5])
+cbar.locator = MaxNLocator(nbins=4)
+cbar.update_ticks()
 
 # --- B. 关键深度曲线 ---
 ax = axes[1]
 line_depths = [1, 4, 8, 12, 16]
+line_depths = [d for d in line_depths if d <= trained_depth]
 for depth, color in zip(line_depths, ORDINAL_5):
     series = grid[depth - 1]
     ax.plot(steps, series, color=color, linewidth=1.9, solid_capstyle="round",
             marker="o", markersize=3.2, markeredgecolor=SURFACE, markeredgewidth=0.7,
             label=f"{depth} 轮", zorder=3)
-ax.axvspan(3000, 5350, color="#f4f4f2", zorder=0)
-ax.axvline(3000, color=AXIS, linewidth=0.8, zorder=1)
-ax.plot(3000, grid[15, steps.index(3000)], "o", color=ORDINAL_5[-1], markersize=8.0,
+
+y_lo = max(0.0, float(np.nanmin(grid)) - 0.08)
+y_hi = float(np.nanmax(grid)) + 0.22
+ax.set_ylim(y_lo, y_hi)
+ax.axvspan(turn_step, steps[-1] + 300, color="#f4f4f2", zorder=0)
+ax.axvline(turn_step, color=AXIS, linewidth=0.8, zorder=1)
+ax.plot(best16_step, best16_loss, "o", color=ORDINAL_5[-1], markersize=8.0,
         markeredgecolor=SURFACE, markeredgewidth=2.0, zorder=5)
-ax.annotate(f"3000 步见底 {grid[15, steps.index(3000)]:.3f}",
-            xy=(3000, grid[15, steps.index(3000)]), xytext=(2450, 1.425),
+ax.annotate(f"{best16_step} 步见底 {best16_loss:.3f}",
+            xy=(best16_step, best16_loss),
+            xytext=(max(steps[0] + 50, best16_step - 550), y_lo + 0.035),
             fontsize=8.8, color=INK, ha="right", va="bottom",
             arrowprops=dict(arrowstyle="-", color=AXIS, linewidth=0.8))
-ax.text(4200, 1.415, "最后 2000 步：loss 回升", fontsize=8.8, color=GRAY, ha="center")
-ax.annotate("1 轮随训练变差", xy=(4999, grid[0, -1]), xytext=(4300, 2.60),
-            fontsize=8.8, color=INK, ha="right", va="bottom",
-            arrowprops=dict(arrowstyle="-", color=AXIS, linewidth=0.8))
-ax.annotate("16 轮", xy=(4999, grid[15, -1]), xytext=(5120, grid[15, -1] + 0.02),
-            fontsize=8.8, color=INK, ha="left", va="bottom")
-ax.set_xlim(300, 5320)
-ax.set_ylim(1.40, 2.95)
-ax.set_yticks([1.5, 2.0, 2.5])
+ax.text((turn_step + steps[-1]) / 2, y_lo + 0.02, "拐点之后：loss 回升",
+        fontsize=8.8, color=GRAY, ha="center", va="bottom")
+if grid[0, -1] > grid[0, 0]:
+    ax.annotate("1 轮随训练变差", xy=(steps[-1], grid[0, -1]),
+                xytext=(steps[-1] - 700, grid[0, -1] - 0.12),
+                fontsize=8.8, color=INK, ha="right", va="top",
+                arrowprops=dict(arrowstyle="-", color=AXIS, linewidth=0.8))
+ax.annotate(f"{trained_depth} 轮", xy=(steps[-1], grid[-1, -1]),
+            xytext=(steps[-1] + 120, grid[-1, -1]), fontsize=8.8, color=INK,
+            ha="left", va="bottom")
+ax.set_xlim(steps[0] - 200, steps[-1] + 320)
+ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
 ax.set_xlabel("训练步数", fontsize=9.5)
 ax.set_ylabel("验证 loss", fontsize=9.5)
-ax.set_title("B  五个深度：3000 步是共同拐点", loc="left", fontsize=11.5,
+ax.set_title(f"B  五个深度：深层在 {turn_step} 步见底", loc="left", fontsize=11.5,
              fontweight="semibold", pad=8)
-ax.legend(loc="upper right", fontsize=8.5, ncol=3, handlelength=1.3,
-          columnspacing=1.0, borderaxespad=0.2, labelspacing=0.35)
+ax.legend(loc="upper right", fontsize=8.5, ncol=5, handlelength=1.3,
+          columnspacing=0.9, borderaxespad=0.2)
 style_axis(ax)
 
-fig.text(0.055, 0.035, "数据：loop_train_metrics.csv；热力图只画 step 500 之后，"
-                       "避免初始 4.33 压缩色标。",
+fig.text(0.055, 0.035, "数据：loop_train_metrics.csv；热力图只画训练开始后的 checkpoint，"
+                       "避免初始高 loss 压缩色标。",
          fontsize=8.2, color=GRAY, ha="left", va="bottom")
 fig.savefig("loop_training_analysis.png", dpi=200)
 plt.close(fig)
